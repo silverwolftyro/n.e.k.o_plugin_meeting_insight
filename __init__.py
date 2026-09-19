@@ -18,7 +18,6 @@ import re
 import time
 
 import httpx
-
 from plugin.sdk.plugin import (
     NekoPluginBase,
     Ok,
