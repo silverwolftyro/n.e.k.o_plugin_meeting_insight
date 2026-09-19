@@ -1,96 +1,45 @@
-# Meeting Insight
+# 联网搜索助手（meeting_insight）
 
-Describe what this plugin does and how to configure it.
+为 N.E.K.O. 提供**基于 DeepSeek 国内 API 的联网搜索能力**。无需配置 Tavily、无需代理，填入一个 DeepSeek API Key 即可使用。
 
-## Development
+## 为什么需要它
 
-The plugin source and its Git repository live at:
+系统内置的联网搜索通常依赖第三方服务（如 Tavily），国内用户配置门槛较高。本插件直接调用 DeepSeek 服务端自带的 web_search 能力，只需一个国内可访问的 API Key，开箱即用。
 
-```text
-N.E.K.O/plugin/plugins/meeting_insight
-```
+## 功能
 
-插件源码及其 Git 仓库直接位于：
+- **api_web_search**：通用联网搜索工具。用户询问新闻、实时数据、最新事件、产品版本，或任何你不确定的事实时，它会自动联网检索并返回带引用来源的结论。
+- **meeting_summarize**：会议记录总结工具。从会议转写文本中提炼核心要点与待办事项，可选联网检索补充背景。
 
-```text
-N.E.K.O/plugin/plugins/meeting_insight
-```
+## 安装
 
-プラグインのソースと Git リポジトリは次の場所にあります：
+方式一：从插件市场安装（推荐）
+方式二：手动导入 `meeting_insight.neko-plugin` 包
 
-```text
-N.E.K.O/plugin/plugins/meeting_insight
-```
+## 配置
 
-When publishing to the plugin market, use this GitHub repository name:
+在插件配置中填入以下字段：
 
-发布到插件市场时，请使用以下 GitHub 仓库名：
+- `deepseek_api_key`：必填。你的 DeepSeek API Key，可从 https://platform.deepseek.com 申请。
+- `deepseek_base_url`：可选，默认 `https://api.deepseek.com`。
+- `deepseek_model`：可选，默认 `deepseek-chat`。
+- `web_search_enabled`：可选，默认 `true`。控制是否启用联网检索。
+- `web_search_max_uses`：可选，默认 `5`。单次调用最多检索次数。
 
-プラグインマーケットへ公開する際は、次の GitHub リポジトリ名を使用してください：
+**安全提示**：请勿将 API Key 填入插件源码目录的 `plugin.toml`。推荐在 N.E.K.O. 插件管理页面的「配置」标签里填写，它保存在用户运行期配置中，不会随代码提交到 Git。
 
-```text
-n.e.k.o_plugin_meeting_insight
-```
+## 使用示例
 
-From this plugin repository root:
+在 N.E.K.O. 对话界面直接提问，例如：
 
-```bash
-uvx ruff==0.12.4 check --ignore-noqa --config ruff.toml .
-```
+> 帮我搜一下最近有什么 AI 相关的大新闻。
 
-From the N.E.K.O repository root / 在 N.E.K.O 仓库根目录中 / N.E.K.O リポジトリのルートで：
+> 2026 年 9 月 18 日外交部发言人说了什么？
 
-```bash
-uv run --with pip neko-plugin sync meeting_insight --clean
-uv run neko-plugin check meeting_insight
-uv run neko-plugin check -r meeting_insight
-```
+模型会自动判断是否需要联网，并在需要时调用本插件。
 
-Python runtime dependencies are declared in `pyproject.toml` and synced into
-`vendor/` for packaging. The generated `vendor/` directory is not committed;
-local builds and CI recreate it before release checks.
+## 版本
 
-Python 运行时依赖声明在 `pyproject.toml` 中，并在打包时同步到 `vendor/`。
-生成的 `vendor/` 不提交；本地构建和 CI 会在发布检查前重新生成它。
-
-Python ランタイム依存関係は `pyproject.toml` に宣言し、パッケージ化時に
-`vendor/` へ同期します。生成された `vendor/` はコミットせず、ローカルビルドと
-CI が公開前チェックで再生成します。
-
-## Market release / Market 发布 / Market 公開
-
-Publish the version declared in `plugin.toml`. By default this pushes the Git
-tag, waits for the standard GitHub Release, and notifies the plugin market.
-
-发布 `plugin.toml` 中声明的版本。默认会推送 Git tag、等待标准 GitHub
-Release，然后通知插件市场。
-
-`plugin.toml` で宣言されたバージョンを公開します。既定では Git tag を
-push し、標準 GitHub Release を待ってからプラグインマーケットへ通知します。
-
-```bash
-uv run neko-plugin publish meeting_insight
-```
-
-To run only one half explicitly / 如需仅执行一部分 / 一方のみを実行する場合:
-
-```bash
-uv run neko-plugin publish github meeting_insight
-uv run neko-plugin publish market https://github.com/owner/repo/releases/tag/v0.1.0
-```
-
-The generated `.github/workflows/release.yml` builds and uploads
-`meeting_insight.neko-plugin`. The market independently verifies that Release
-before publishing it.
-
-生成的 `.github/workflows/release.yml` 会构建并上传插件包；Market 会独立验证
-该 Release 后再发布。
-
-生成された `.github/workflows/release.yml` がプラグインパッケージをビルドして
-アップロードし、Market はその Release を独立検証してから公開します。
-
-## Entry
-
-```toml
-entry = "plugin.plugins.meeting_insight:MeetingInsightPlugin"
-```
+- 当前版本：v0.1.1
+- 作者：silverwolftyro
+- 仓库：https://github.com/silverwolftyro/n.e.k.o_plugin_meeting_insight
