@@ -1,11 +1,16 @@
-"""浼氳璁板綍 / 鍙鍖?/ 鎬荤粨 鎻掍欢銆?
-``meeting_summarize`` 鏈変袱鏉¤矾寰勶細
+"""会议记录 / 可视化 / 总结 插件。
 
-* **鑱旂綉璺緞**锛堥厤缃簡 ``deepseek_api_key``锛夛細鎶婁細璁浆鍐欐嫾鎴?Prompt锛岄€氳繃
-  DeepSeek 鐨?Anthropic 鍏煎绔偣锛坄`/anthropic/v1/messages``锛夎皟鐢ㄦā鍨嬶紝骞跺湪
-  璇锋眰閲屽０鏄庢湇鍔＄ ``web_search`` 宸ュ叿 鈥斺€?鏄惁鑱旂綉鐢辨ā鍨嬭嚜琛屽喅瀹氾紝妫€绱㈢粨鏋滅敱
-  鏈嶅姟绔敞鍏ュ苟浠?``web_search_tool_result`` 鍧楄繑鍥炪€?* **鏈湴鍥為€€璺緞**锛堟湭閰嶇疆 key / API 璋冪敤澶辫触锛夛細閫€鍥?``_summarize_local`` 鐨?  绾瓧绗︿覆缁撴瀯鍖栨彁鍙栵紝骞跺湪杈撳嚭閲屾爣璁?``fallback: true``銆?
-缃戠粶璁块棶涓€寰嬭蛋 ``httpx.AsyncClient``锛涙ā鍧楅《灞備笉鍋氫换浣?IO銆?"""
+``meeting_summarize`` 有两条路径：
+
+* **联网路径**（配置了 ``deepseek_api_key``）：把会议转写拼成 Prompt，通过
+  DeepSeek 的 Anthropic 兼容端点（``/anthropic/v1/messages``）调用模型，并在
+  请求里声明服务端 ``web_search`` 工具 —— 是否联网由模型自行决定，检索结果由
+  服务端注入并以 ``web_search_tool_result`` 块返回。
+* **本地回退路径**（未配置 key / API 调用失败）：退回 ``_summarize_local`` 的
+  纯字符串结构化提取，并在输出里标记 ``fallback: true``。
+
+网络访问一律走 ``httpx.AsyncClient``；模块顶层不做任何 IO。
+"""
 from __future__ import annotations
 
 import json
@@ -24,7 +29,7 @@ from plugin.sdk.plugin import (
 )
 
 # ---------------------------------------------------------------------------
-# 甯搁噺
+# 常量
 # ---------------------------------------------------------------------------
 
 DEFAULT_MAX_POINTS = 5
@@ -37,38 +42,45 @@ DEFAULT_WEB_SEARCH_MAX_USES = 5
 MAX_WEB_SEARCH_USES_CAP = 10
 DEFAULT_REQUEST_TIMEOUT = 60.0
 
-# DeepSeek 鐨?Anthropic 鍏煎鍏ュ彛銆?_ANTHROPIC_MESSAGES_PATH = "/anthropic/v1/messages"
-# 鏈嶅姟绔仈缃戞绱㈠伐鍏风殑鐗堟湰鏍囪瘑锛圓nthropic Messages API 鐨?tool type锛夈€?_WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
+# DeepSeek 的 Anthropic 兼容入口。
+_ANTHROPIC_MESSAGES_PATH = "/anthropic/v1/messages"
+# 服务端联网检索工具的版本标识（Anthropic Messages API 的 tool type）。
+_WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
 _MAX_OUTPUT_TOKENS = 4096
 _MAX_RELATED_CONTEXT = 5
 
-# 鍗曟宸ュ叿璋冪敤鐨勬€婚绠椼€俙`@llm_tool(timeout=60.0)`` 鏄涓讳晶纭笂闄愶細鐪熷疄鐨?# HTTP 寰€杩斿繀椤诲湪杩欎釜绐楀彛鍐呯粨鏉燂紝鍚﹀垯浼氳瀹夸富鎴柇鎴?TOOL_TIMEOUT锛岀湅涓嶅埌鐪熷疄
-# 閿欒銆傝繖閲岀暀 5s 浣欓噺缁?IPC 涓庡簭鍒楀寲銆?_TOTAL_BUDGET_SECONDS = 55.0
+# 单次工具调用的总预算。``@llm_tool(timeout=60.0)`` 是宿主侧硬上限：真实的
+# HTTP 往返必须在这个窗口内结束，否则会被宿主截断成 TOOL_TIMEOUT，看不到真实
+# 错误。这里留 5s 余量给 IPC 与序列化。
+_TOTAL_BUDGET_SECONDS = 55.0
 _MIN_REQUEST_TIMEOUT = 5.0
 
-# 鐥呮€佽緭鍏ヤ繚鎶わ細瓒呴暱杞啓鍏堟埅鏂紝閬垮厤鍗曟宸ュ叿璋冪敤闀挎椂闂村崰鐢ㄥ璇濊疆銆?_MAX_TRANSCRIPT_CHARS = 20_000
+# 病态输入保护：超长转写先截断，避免单次工具调用长时间占用对话轮。
+_MAX_TRANSCRIPT_CHARS = 20_000
 _MAX_SENTENCES = 400
 _MIN_SENTENCE_CHARS = 4
 _MAX_SUMMARY_BODY_CHARS = 300
 
-# 鍙ュ瓙缁堟绗︼細涓枃鏍囩偣锛涙垨鑻辨枃鍙ュ彿鍚庤窡绌虹櫧/缁撳熬锛堥伩鍏嶈鍒?3.5 / v1.2锛夈€?_SENTENCE_RE = re.compile(
-    r"[^銆傦紒锛??锛?\n]+?(?:[銆傦紒锛??锛?]|\.(?=\s|$)|\n|$)"
+# 句子终止符：中文标点；或英文句号后跟空白/结尾（避免误切 3.5 / v1.2）。
+_SENTENCE_RE = re.compile(
+    r"[^。！？!?；;\n]+?(?:[。！？!?；;]|\.(?=\s|$)|\n|$)"
 )
 
-# 寰呭姙淇″彿璇嶏細鍛戒腑鍗宠涓恒€岃鍔ㄩ」銆嶃€傛瘮杈冨墠缁熶竴 casefold銆?_ACTION_HINTS = (
-    "闇€瑕?, "搴旇", "璐熻矗", "璺熻繘", "瀹夋帓", "纭", "瀹屾垚", "鎺ㄨ繘",
-    "涓嬪懆", "鏄庡ぉ", "涔嬪墠", "鎴", "灏藉揩", "钀藉疄", "寰呭姙",
+# 待办信号词：命中即视为「行动项」。比较前统一 casefold。
+_ACTION_HINTS = (
+    "需要", "应该", "负责", "跟进", "安排", "确认", "完成", "推进",
+    "下周", "明天", "之前", "截止", "尽快", "落实", "待办",
     "todo", "action", "follow up", "follow-up", "assign",
     "deadline", "next step", "owner",
 )
 
 # ---------------------------------------------------------------------------
-# 绾嚱鏁拌緟鍔╁眰锛氭棤 IO銆佹棤鍓綔鐢ㄣ€佹棤 await锛屽彲鐩存帴鍗曟祴
+# 纯函数辅助层：无 IO、无副作用、无 await，可直接单测
 # ---------------------------------------------------------------------------
 
 
 def _coerce_text(value: object, default: str = "") -> str:
-    """瀹夊叏鍦版妸閰嶇疆鍊?/ API 杩斿洖鍊煎彇鎴愬瓧绗︿覆銆?""
+    """安全地把配置值 / API 返回值取成字符串。"""
     if isinstance(value, str):
         return value.strip()
     if value is None or isinstance(value, bool):
@@ -79,7 +91,7 @@ def _coerce_text(value: object, default: str = "") -> str:
 
 
 def _coerce_bool(value: object, default: bool) -> bool:
-    """鎶婇厤缃噷鐨勫竷灏斿€煎綊涓€鍖栵紝鍏煎 ``"true"`` / ``"1"`` 杩欑被瀛楃涓插啓娉曘€?""
+    """把配置里的布尔值归一化，兼容 ``"true"`` / ``"1"`` 这类字符串写法。"""
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -95,7 +107,7 @@ def _coerce_bool(value: object, default: bool) -> bool:
 
 
 def _coerce_timeout(value: object, default: float) -> float:
-    """鎶婇厤缃噷鐨勮秴鏃跺€煎綊涓€鍖栦负姝ｆ诞鐐规暟锛岄潪娉曞€煎洖钀藉埌榛樿鍊笺€?""
+    """把配置里的超时值归一化为正浮点数，非法值回落到默认值。"""
     if isinstance(value, bool):
         return default
     if isinstance(value, (int, float)):
@@ -111,8 +123,12 @@ def _coerce_timeout(value: object, default: float) -> float:
 
 
 def _http_status_of(exc: BaseException) -> int | str:
-    """浠庡紓甯搁噷瀹夊叏鍙栧嚭 HTTP 鐘舵€佺爜锛屽彇涓嶅埌灏辫繑鍥?``"-"``銆?
-    鍙彇鐘舵€佺爜锛岀粷涓嶇 response body 鈥斺€?body 鍙兘鍥炴樉璇锋眰鍐呭銆傛湁浜嗗畠锛?    銆岀鐐?宸ュ叿绫诲瀷涓嶈鏀寔銆嶏紙閫氬父 400锛変笌銆岄壌鏉冨け璐ャ€嶏紙401锛夈€併€岃矾寰勫啓閿欍€?    锛?04锛夋墠鑳藉湪鏃ュ織閲屽尯鍒嗗紑銆傜函鍑芥暟銆?    """
+    """从异常里安全取出 HTTP 状态码，取不到就返回 ``"-"``。
+
+    只取状态码，绝不碰 response body —— body 可能回显请求内容。有了它，
+    「端点/工具类型不被支持」（通常 400）与「鉴权失败」（401）、「路径写错」
+    （404）才能在日志里区分开。纯函数。
+    """
     status = getattr(getattr(exc, "response", None), "status_code", None)
     if isinstance(status, int):
         return status
@@ -120,9 +136,11 @@ def _http_status_of(exc: BaseException) -> int | str:
 
 
 def _as_text_list(value: object, *, max_items: int) -> list[str]:
-    """鎶婃ā鍨嬭繑鍥炵殑浠绘剰褰㈢姸褰掍竴鎴愬瓧绗︿覆鍒楄〃銆?
-    妯″瀷鏈夋鐜囨妸鏁扮粍鍐欐垚瀛楃涓层€佹妸瑕佺偣鍐欐垚 ``{"point": "..."}``銆佹垨缁欏嚭瓒呴暱
-    鍒楄〃銆傝繖閲岀粺涓€鍏滃簳锛屼繚璇佷氦浠樼粰瀵硅瘽妯″瀷鐨勭粨鏋勭ǔ瀹氥€?    """
+    """把模型返回的任意形状归一成字符串列表。
+
+    模型有概率把数组写成字符串、把要点写成 ``{"point": "..."}``、或给出超长
+    列表。这里统一兜底，保证交付给对话模型的结构稳定。
+    """
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, list):
@@ -146,9 +164,13 @@ def _as_text_list(value: object, *, max_items: int) -> list[str]:
 
 
 def _normalize_limit(value: object) -> int:
-    """鎶婃ā鍨嬩紶鏉ョ殑 ``max_points`` 褰掍竴鍖栧埌 1..MAX_POINTS_CAP銆?
-    妯″瀷鍋跺皵浼氫紶瀛楃涓?/ 甯冨皵 / None / 瓒呯晫鍊笺€傝繖閲屽氨鍦板厹搴曡€屼笉鏄姏寮傚父锛?    鎶涘紓甯镐細璁╁伐鍏风粨鏋滈€€鍖栨垚涓€涓ā鍨嬬湅涓嶆噦鐨勯€氱敤閿欒淇″皝銆?    """
-    if isinstance(value, bool):  # bool 鏄?int 鐨勫瓙绫伙紝蹇呴』鍏堟尅鎺?        return DEFAULT_MAX_POINTS
+    """把模型传来的 ``max_points`` 归一化到 1..MAX_POINTS_CAP。
+
+    模型偶尔会传字符串 / 布尔 / None / 超界值。这里就地兜底而不是抛异常：
+    抛异常会让工具结果退化成一个模型看不懂的通用错误信封。
+    """
+    if isinstance(value, bool):  # bool 是 int 的子类，必须先挡掉
+        return DEFAULT_MAX_POINTS
     if isinstance(value, (int, float)):
         parsed = int(value)
     elif isinstance(value, str):
@@ -162,7 +184,7 @@ def _normalize_limit(value: object) -> int:
 
 
 def _normalize_web_search_max_uses(value: object) -> int:
-    """鎶?``web_search_max_uses`` 閽冲埗鍒?1..MAX_WEB_SEARCH_USES_CAP銆?""
+    """把 ``web_search_max_uses`` 钳制到 1..MAX_WEB_SEARCH_USES_CAP。"""
     if isinstance(value, bool):
         return DEFAULT_WEB_SEARCH_MAX_USES
     if isinstance(value, (int, float)):
@@ -178,7 +200,7 @@ def _normalize_web_search_max_uses(value: object) -> int:
 
 
 def _split_sentences(text: str) -> list[str]:
-    """鎸変腑鑻辨枃鏍囩偣鍒囧彞锛氫繚搴忋€佸幓绌虹櫧銆佷涪寮冭繃鐭墖娈点€侀檺鍒舵€诲彞鏁般€?""
+    """按中英文标点切句：保序、去空白、丢弃过短片段、限制总句数。"""
     sentences: list[str] = []
     for raw in _SENTENCE_RE.findall(text):
         cleaned = " ".join(raw.split())
@@ -190,9 +212,11 @@ def _split_sentences(text: str) -> list[str]:
 
 
 def _pick_key_points(sentences: list[str], limit: int) -> list[str]:
-    """鍙栨渶闀跨殑鑻ュ共涓彞瀛愪綔涓烘牳蹇冭鐐癸紝杈撳嚭鏃舵仮澶嶅師鏂囬『搴忋€?
-    鎸夐暱搴︽寫閫夈€佹寜鍘熸枃椤哄簭杈撳嚭锛氭寫閫変緷鎹槸銆屼俊鎭噺銆嶏紝浣嗛槄璇婚『搴忓繀椤绘槸
-    浼氳鍙戠敓鐨勯『搴忥紝鍚﹀垯瑕佺偣鍒楄〃浼氭樉寰楅涓夊€掑洓銆?    """
+    """取最长的若干个句子作为核心要点，输出时恢复原文顺序。
+
+    按长度挑选、按原文顺序输出：挑选依据是「信息量」，但阅读顺序必须是
+    会议发生的顺序，否则要点列表会显得颠三倒四。
+    """
     if not sentences:
         return []
     ranked = sorted(
@@ -205,7 +229,7 @@ def _pick_key_points(sentences: list[str], limit: int) -> list[str]:
 
 
 def _extract_action_items(sentences: list[str], limit: int) -> list[str]:
-    """鎸夊緟鍔炰俊鍙疯瘝鎸戣鍔ㄩ」锛氫繚搴忋€佸幓閲嶃€侀檺閲忋€?""
+    """按待办信号词挑行动项：保序、去重、限量。"""
     items: list[str] = []
     seen: set[str] = set()
     for sentence in sentences:
@@ -226,22 +250,24 @@ def _build_summary(
     key_points: list[str],
     action_count: int,
 ) -> str:
-    """鎷间竴娈靛彲璇荤殑妯℃嫙鎽樿锛堢粺璁℃瑙?+ 瑕佺偣鍘熸枃锛夈€?""
+    """拼一段可读的模拟摘要（统计概览 + 要点原文）。"""
     if not sentences:
-        return "锛堣浆鍐欐枃鏈湭鍖呭惈鍙瘑鍒殑鍙ュ瓙锛屾棤娉曠敓鎴愭憳瑕侊級"
-    head = f"鏈浼氳鍏辫瘑鍒?{len(sentences)} 鍙ュ彂瑷€锛屾彁鐐煎嚭 {len(key_points)} 鏉℃牳蹇冭鐐?
+        return "（转写文本未包含可识别的句子，无法生成摘要）"
+    head = f"本次会议共识别 {len(sentences)} 句发言，提炼出 {len(key_points)} 条核心要点"
     if action_count:
-        head += f"銆亄action_count} 鏉″緟鍔炰簨椤?
-    head += "銆?
+        head += f"、{action_count} 条待办事项"
+    head += "。"
     body = " ".join(key_points)
     if len(body) > _MAX_SUMMARY_BODY_CHARS:
-        body = body[:_MAX_SUMMARY_BODY_CHARS].rstrip() + "鈥?
+        body = body[:_MAX_SUMMARY_BODY_CHARS].rstrip() + "…"
     return f"{head}{body}"
 
 
 def _summarize_local(transcript: str, limit: int) -> dict[str, object]:
-    """鏈湴缁撴瀯鍖栨彁鍙栵細鍒囧彞 鈫?鎸戞牳蹇冭鐐?鈫?鎸戝緟鍔?鈫?鎷兼憳瑕併€?
-    绾瓧绗︿覆澶勭悊锛? 涓囧瓧绗﹂噺绾т负姣绾э紝涓嶉樆濉炰簨浠跺惊鐜紝鏃犻渶 to_thread銆?    """
+    """本地结构化提取：切句 → 挑核心要点 → 挑待办 → 拼摘要。
+
+    纯字符串处理，2 万字符量级为毫秒级，不阻塞事件循环，无需 to_thread。
+    """
     sentences = _split_sentences(transcript)
     key_points = _pick_key_points(sentences, limit)
     action_items = _extract_action_items(sentences, limit)
@@ -254,72 +280,84 @@ def _summarize_local(transcript: str, limit: int) -> dict[str, object]:
 
 
 def _build_prompt(transcript: str) -> str:
-    """鎶婁細璁浆鍐欐嫾鎴愮粰 DeepSeek 鐨勮灏?Prompt銆?
-    绾嚱鏁帮細鏃?IO銆佹棤鍓綔鐢紝渚夸簬鍗曟祴銆?
-    Prompt 鏄庣‘鍛婄煡妯″瀷鍙互浣跨敤鏈嶅姟绔?``web_search`` 宸ュ叿鑷鑱旂綉锛屽苟瑕佹眰瀹冪敤
-    ``[鏉ユ簮 N]`` 鏍囨敞寮曠敤銆傛彁绀鸿瘝閲屽繀椤讳繚鐣?"JSON" 瀛楁牱锛氱粨鏋勫寲杈撳嚭鐨勭害鏉熷湪
-    Anthropic 鍏煎绔偣鐢辨彁绀鸿瘝鎵挎媴锛屽幓鎺夎繖涓瘝浼氳妯″瀷鏇村鏄撹緭鍑烘暎鏂囥€?    """
+    """把会议转写拼成给 DeepSeek 的详尽 Prompt。
+
+    纯函数：无 IO、无副作用，便于单测。
+
+    Prompt 明确告知模型可以使用服务端 ``web_search`` 工具自行联网，并要求它用
+    ``[来源 N]`` 标注引用。提示词里必须保留 "JSON" 字样：结构化输出的约束在
+    Anthropic 兼容端点由提示词承担，去掉这个词会让模型更容易输出散文。
+    """
     return (
-        "浣犳槸涓€鍚嶈祫娣变細璁邯瑕佸垎鏋愬笀銆傝闃呰涓嬫柟鐨勩€愪細璁浆鍐欍€戯紝"
-        "杈撳嚭涓€浠界粨鏋勫寲鐨勪細璁礊瀵熸姤鍛娿€俓n\n"
-        "## 鍙敤宸ュ叿\n"
-        "浣犲彲浠ヤ娇鐢?web_search 宸ュ叿鑱旂綉妫€绱㈢浉鍏充俊鎭紝鐢ㄤ簬琛ュ厖浼氳涓彁鍒扮殑澶栭儴"
-        "鑳屾櫙锛堜骇鍝併€佸叕鍙搞€佹妧鏈€佹斂绛栥€佷汉鐗┿€佷簨浠剁瓑锛夈€傛槸鍚︽绱㈢敱浣犺嚜琛屽垽鏂細"
-        "鍙湁褰撲細璁唴瀹规秹鍙婁綘涓嶇‘瀹氥€佹垨闇€瑕佽緝鏂板閮ㄤ俊鎭殑姒傚康鏃舵墠妫€绱紝"
-        "涓嶈涓轰簡妫€绱㈣€屾绱€俓n\n"
-        "## 杈撳嚭鏍煎紡\n"
-        "鍙緭鍑轰竴涓?JSON 瀵硅薄銆備笉瑕佽緭鍑轰换浣曡В閲婃€ф枃瀛楋紝涓嶈鐢?Markdown 浠ｇ爜鍧?
-        "鍖呰９锛屼笉瑕佸湪 JSON 鍓嶅悗娣诲姞浠讳綍瀛楃銆侸SON 蹇呴』涓ユ牸绗﹀悎浠ヤ笅缁撴瀯锛歕n"
+        "你是一名资深会议纪要分析师。请阅读下方的【会议转写】，"
+        "输出一份结构化的会议洞察报告。\n\n"
+        "## 可用工具\n"
+        "你可以使用 web_search 工具联网检索相关信息，用于补充会议中提到的外部"
+        "背景（产品、公司、技术、政策、人物、事件等）。是否检索由你自行判断："
+        "只有当会议内容涉及你不确定、或需要较新外部信息的概念时才检索，"
+        "不要为了检索而检索。\n\n"
+        "## 输出格式\n"
+        "只输出一个 JSON 对象。不要输出任何解释性文字，不要用 Markdown 代码块"
+        "包裹，不要在 JSON 前后添加任何字符。JSON 必须严格符合以下结构：\n"
         "{\n"
-        '  "summary": "瀛楃涓层€備竴娈佃繛璐殑浼氳鎽樿锛?50-400 瀛楋紝娑电洊浼氳涓婚銆?
-        '鍏抽敭缁撹涓庢暣浣撹蛋鍚戙€傚繀椤绘槸瀹屾暣娈佃惤锛屼笉鑳芥槸瑕佺偣缃楀垪銆?,\n'
-        '  "key_points": ["瀛楃涓叉暟缁勩€?-8 鏉℃牳蹇冭鐐癸紝姣忔潯涓€鍙ヨ瘽锛?
-        '鎸変細璁疄闄呭彂鐢熺殑椤哄簭鎺掑垪銆?],\n'
-        '  "action_items": ["瀛楃涓叉暟缁勩€傚緟鍔炰簨椤癸紝姣忔潯鍖呭惈鍏蜂綋鍔ㄤ綔锛?
-        '骞跺湪鍘熸枃鎻愬埌鏃跺甫涓婅礋璐ｄ汉涓庢椂闂淬€傚師鏂囨病鏈夋槑纭緟鍔炴椂杩斿洖绌烘暟缁勩€?],\n'
-        '  "related_context": ["瀛楃涓叉暟缁勩€傚熀浜庤仈缃戞绱㈠埌鐨勮祫鏂欏浼氳鍐呭鎵€鍋氱殑'
-        '鑳屾櫙琛ュ厖銆傛瘡鏉￠』鍐欐槑瀹冭ˉ鍏呬簡浼氳涓殑鍝釜璇濋锛屽苟鐢?[鏉ユ簮 N] 鏍囨敞鎵€寮曠敤'
-        '鐨勭綉椤碉紙N 涓庢绱㈢粨鏋滅殑鍑虹幇椤哄簭涓€鑷达級銆傛病鏈夋绱€佹垨妫€绱㈢粨鏋滀笌浼氳鏃犲叧鏃?
-        '杩斿洖绌烘暟缁勩€?]\n'
+        '  "summary": "字符串。一段连贯的会议摘要，150-400 字，涵盖会议主题、'
+        '关键结论与整体走向。必须是完整段落，不能是要点罗列。",\n'
+        '  "key_points": ["字符串数组。3-8 条核心要点，每条一句话，'
+        '按会议实际发生的顺序排列。"],\n'
+        '  "action_items": ["字符串数组。待办事项，每条包含具体动作，'
+        '并在原文提到时带上负责人与时间。原文没有明确待办时返回空数组。"],\n'
+        '  "related_context": ["字符串数组。基于联网检索到的资料对会议内容所做的'
+        '背景补充。每条须写明它补充了会议中的哪个话题，并用 [来源 N] 标注所引用'
+        '的网页（N 与检索结果的出现顺序一致）。没有检索、或检索结果与会议无关时'
+        '返回空数组。"]\n'
         "}\n\n"
-        "## 瑙勫垯\n"
-        "1. 浣跨敤浼氳杞啓鍘熸湰鐨勮瑷€浣滅瓟锛屼笉瑕佺炕璇戞垚鍏朵粬璇█銆俓n"
-        "2. 鍙緷鎹粰瀹氭潗鏂欎笌妫€绱㈢粨鏋滐紝涓嶈缂栭€犳湭鍑虹幇鐨勪簨瀹炪€佷汉鍚嶃€佹暟瀛椼€佹棩鏈熸垨缁撹銆俓n"
-        "3. key_points 鎸変細璁椂闂撮『搴忔帓鍒楋紝涓嶈鎶婁笉鍚岃瘽棰樺悎骞舵垚涓€鏉°€俓n"
-        "4. action_items 蹇呴』鍙墽琛岋紱鍘熸枃鏈寚鏄庤礋璐ｄ汉鏃跺彧鍐欏姩浣滐紝涓嶈鑷嗛€犱汉鍚嶃€俓n"
-        "5. related_context 鍙敤浜庤ˉ鍏呰儗鏅紝涓嶅緱瑕嗙洊鎴栨敼鍐欎細璁師鏂囩殑缁撹锛?
-        "濡傛灉妫€绱㈢粨鏋滀笌浼氳鍐呭鏃犲叧锛屽畞鍙繑鍥炵┖鏁扮粍銆俓n"
-        "6. 鎵€鏈夋暟缁勫瓧娈靛繀椤绘槸 JSON 鏁扮粍锛涙病鏈夊唴瀹规椂鐢?[]锛屼笉瑕佺敤 null銆俓n"
-        "7. 瀛楁鍚嶅繀椤讳笌涓婇潰鐨勭粨鏋勫畬鍏ㄤ竴鑷达紝涓嶈澧炲姞鎴栧垹闄や换浣曞瓧娈点€俓n"
-        "8. 寮曠敤缃戦〉鏃朵娇鐢?[鏉ユ簮 N] 鏍囨敞锛屼笉瑕佺洿鎺ョ矘璐撮暱 URL銆俓n\n"
-        f"## 浼氳杞啓\n{transcript}\n"
+        "## 规则\n"
+        "1. 使用会议转写原本的语言作答，不要翻译成其他语言。\n"
+        "2. 只依据给定材料与检索结果，不要编造未出现的事实、人名、数字、日期或结论。\n"
+        "3. key_points 按会议时间顺序排列，不要把不同话题合并成一条。\n"
+        "4. action_items 必须可执行；原文未指明负责人时只写动作，不要臆造人名。\n"
+        "5. related_context 只用于补充背景，不得覆盖或改写会议原文的结论；"
+        "如果检索结果与会议内容无关，宁可返回空数组。\n"
+        "6. 所有数组字段必须是 JSON 数组；没有内容时用 []，不要用 null。\n"
+        "7. 字段名必须与上面的结构完全一致，不要增加或删除任何字段。\n"
+        "8. 引用网页时使用 [来源 N] 标注，不要直接粘贴长 URL。\n\n"
+        f"## 会议转写\n{transcript}\n"
     )
 
 
 def _build_search_prompt(query: str) -> str:
-    """鏋勯€犻€氱敤鑱旂綉鎼滅储宸ュ叿锛坄`api_web_search``锛夌敤鐨?Prompt銆傜函鍑芥暟銆?
-    涓庝細璁ā鏉挎棤鍏筹細鍙姹傛ā鍨嬫绱㈠悗杈撳嚭 ``{"summary", "sources"}``銆?    鎻愮ず璇嶉噷蹇呴』鍑虹幇 "JSON" 瀛楁牱锛屽苟鏄庣‘绂佹鏁ｆ枃涓?Markdown 浠ｇ爜鍧楀寘瑁广€?    """
+    """构造通用联网搜索工具（``api_web_search``）用的 Prompt。纯函数。
+
+    与会议模板无关：只要求模型检索后输出 ``{"summary", "sources"}``。
+    提示词里必须出现 "JSON" 字样，并明确禁止散文与 Markdown 代码块包裹。
+    """
     return (
-        "浣犳槸涓€涓仈缃戞悳绱㈠姪鎵嬨€傝浣跨敤 web_search 宸ュ叿妫€绱互涓嬮棶棰橈紝"
-        "鐒跺悗鍙緭鍑轰竴涓?JSON 瀵硅薄锛屼笉瑕佽緭鍑轰换浣曞叾浠栨枃瀛椼€俓n"
-        "涓嶈浣跨敤 Markdown 浠ｇ爜鍧楀寘瑁癸紝涓嶈鍦?JSON 鍓嶅悗娣诲姞浠讳綍瀛楃銆俓n"
-        "JSON 缁撴瀯濡備笅锛歕n"
+        "你是一个联网搜索助手。请使用 web_search 工具检索以下问题，"
+        "然后只输出一个 JSON 对象，不要输出任何其他文字。\n"
+        "不要使用 Markdown 代码块包裹，不要在 JSON 前后添加任何字符。\n"
+        "JSON 结构如下：\n"
         "{\n"
-        '  "summary": "鐢ㄤ竴娈佃瘽鍥炵瓟鐢ㄦ埛鐨勯棶棰橈紝鍩轰簬鎼滅储缁撴灉锛屼笉瑕佺紪閫?,\n'
-        '  "sources": ["[鏉ユ簮 1] 鏍囬 鈥?URL", "[鏉ユ簮 2] 鏍囬 鈥?URL"]\n'
+        '  "summary": "用一段话回答用户的问题，基于搜索结果，不要编造",\n'
+        '  "sources": ["[来源 1] 标题 — URL", "[来源 2] 标题 — URL"]\n'
         "}\n"
-        "濡傛灉妫€绱笉鍒版湁鐢ㄤ俊鎭紝summary 瑕佸瀹炶鏄庢湭鑳芥壘鍒帮紝涓嶈鑷嗛€犱簨瀹烇紱"
-        "sources 杩斿洖绌烘暟缁?[]銆俓n\n"
-        f"鐢ㄦ埛闂锛歿query}\n"
+        "如果检索不到有用信息，summary 要如实说明未能找到，不要臆造事实；"
+        "sources 返回空数组 []。\n\n"
+        f"用户问题：{query}\n"
     )
 
 
 def _extract_citations(block: dict[str, object]) -> list[dict[str, object]]:
-    """浠庢绱㈢粨鏋滃潡閲屾彁鍙栧苟褰掍竴鍖栧紩鐢ㄦ潵婧愩€?
-    鍏煎涓ょ杩斿洖褰㈡€侊紙瀹炴祴閮藉嚭鐜拌繃锛夛細
+    """从检索结果块里提取并归一化引用来源。
 
-    * **鎵佸钩缁撴瀯** 鈥斺€?鍧楁湰韬氨鏄竴鏉＄粨鏋滐紝``title`` / ``url`` 鐩存帴鎸傚湪鍧椾笂銆?    * **宓屽缁撴瀯** 鈥斺€?``block["content"]`` 鏄暟缁勶紝姣忎釜鍏冪礌鏄竴鏉＄粨鏋溿€?
-    浼樺厛鎸夋墎骞崇粨鏋勮В鏋愶紱鍙湁鎵佸钩缁撴瀯閲屽彇涓嶅埌 ``url`` 鏃讹紝鎵嶅洖閫€鍒板祵濂楃粨鏋勩€?    鍙繚鐣欏甫 ``url`` 鐨勬潯鐩紝缁熶竴鎴?``{"title": str, "url": str, "snippet": str}``銆?    绾嚱鏁般€?    """
+    兼容两种返回形态（实测都出现过）：
+
+    * **扁平结构** —— 块本身就是一条结果，``title`` / ``url`` 直接挂在块上。
+    * **嵌套结构** —— ``block["content"]`` 是数组，每个元素是一条结果。
+
+    优先按扁平结构解析；只有扁平结构里取不到 ``url`` 时，才回退到嵌套结构。
+    只保留带 ``url`` 的条目，统一成 ``{"title": str, "url": str, "snippet": str}``。
+    纯函数。
+    """
     if _coerce_text(block.get("url")):
         candidates: list[object] = [block]
     else:
@@ -352,7 +390,7 @@ def _extract_citations(block: dict[str, object]) -> list[dict[str, object]]:
 
 
 def _citations_to_context(citations: list[dict[str, object]]) -> list[str]:
-    """鎶婃湇鍔＄寮曠敤鍒楄〃娓叉煋鎴?``related_context`` 鏉＄洰銆傜函鍑芥暟銆?""
+    """把服务端引用列表渲染成 ``related_context`` 条目。纯函数。"""
     lines: list[str] = []
     for index, item in enumerate(citations, 1):
         if not isinstance(item, dict):
@@ -360,11 +398,11 @@ def _citations_to_context(citations: list[dict[str, object]]) -> list[str]:
         url = _coerce_text(item.get("url"))
         if not url:
             continue
-        title = _coerce_text(item.get("title")) or "锛堟棤鏍囬锛?
+        title = _coerce_text(item.get("title")) or "（无标题）"
         snippet = _coerce_text(item.get("snippet"))
-        line = f"[鏉ユ簮 {index}] {title} 鈥?{url}"
+        line = f"[来源 {index}] {title} — {url}"
         if snippet:
-            line += f"锛歿snippet}"
+            line += f"：{snippet}"
         lines.append(line)
         if len(lines) >= _MAX_RELATED_CONTEXT:
             break
@@ -375,11 +413,13 @@ def _normalize_llm_result(
     payload: dict[str, object],
     limit: int,
 ) -> dict[str, object]:
-    """鎶婃ā鍨嬭繑鍥炵殑 dict 褰掍竴鍒版彃浠跺澶栨壙璇虹殑杈撳嚭缁撴瀯銆?
-    妯″瀷杈撳嚭姘歌繙涓嶅彲淇★細瀛楁鍙兘缂哄け銆佺被鍨嬪彲鑳戒笉瀵广€佹暟缁勫彲鑳借秴闀裤€?    """
+    """把模型返回的 dict 归一到插件对外承诺的输出结构。
+
+    模型输出永远不可信：字段可能缺失、类型可能不对、数组可能超长。
+    """
     summary = _coerce_text(payload.get("summary"))
     if not summary:
-        summary = "锛堟ā鍨嬫湭杩斿洖鎽樿锛岃鍙傝€冧笅鏂规牳蹇冭鐐广€傦級"
+        summary = "（模型未返回摘要，请参考下方核心要点。）"
     return {
         "summary": summary,
         "key_points": _as_text_list(payload.get("key_points"), max_items=limit),
@@ -392,7 +432,7 @@ def _normalize_llm_result(
 
 
 # ---------------------------------------------------------------------------
-# 寮傛缃戠粶灞傦細鍙娇鐢?httpx.AsyncClient锛岀粷涓嶄娇鐢?requests
+# 异步网络层：只使用 httpx.AsyncClient，绝不使用 requests
 # ---------------------------------------------------------------------------
 
 
@@ -407,12 +447,18 @@ async def _call_deepseek_with_search(
     web_search_enabled: bool,
     web_search_max_uses: int,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
-    """璋冪敤 DeepSeek 鐨?Anthropic 鍏煎绔偣锛屽彲閫夋嫨鍚敤鏈嶅姟绔仈缃戞绱€?
-    杩斿洖 ``(parsed_json_dict, citations_list)``锛?
-    * ``parsed_json_dict`` 鈥斺€?鎶婃墍鏈?``type == "text"`` 鍐呭鍧楁寜椤哄簭鎷兼帴鍚庤В鏋?      鍑虹殑 JSON 瀵硅薄锛涙嫾鎺ョ粨鏋滀笉鏄悎娉?JSON 瀵硅薄鏃舵姏
-      ``ValueError("ANTHROPIC_NON_OBJECT_JSON")``銆?    * ``citations_list`` 鈥斺€?浠庢墍鏈?``web_search_tool_result`` 鍧椾腑鎻愬彇鐨勫紩鐢紝
-      姣忛」褰掍竴鍖栦负 ``{"title", "url", "snippet"}``銆?
-    闈?2xx / 绌?content / 绌?text 涓€寰嬪悜涓婃姏鍑猴紝鐢辫皟鐢ㄦ柟鍐冲畾鏄惁闄嶇骇銆?    """
+    """调用 DeepSeek 的 Anthropic 兼容端点，可选择启用服务端联网检索。
+
+    返回 ``(parsed_json_dict, citations_list)``：
+
+    * ``parsed_json_dict`` —— 把所有 ``type == "text"`` 内容块按顺序拼接后解析
+      出的 JSON 对象；拼接结果不是合法 JSON 对象时抛
+      ``ValueError("ANTHROPIC_NON_OBJECT_JSON")``。
+    * ``citations_list`` —— 从所有 ``web_search_tool_result`` 块中提取的引用，
+      每项归一化为 ``{"title", "url", "snippet"}``。
+
+    非 2xx / 空 content / 空 text 一律向上抛出，由调用方决定是否降级。
+    """
     url = (
         f"{_coerce_text(base_url).rstrip('/') or DEFAULT_DEEPSEEK_BASE_URL}"
         f"{_ANTHROPIC_MESSAGES_PATH}"
@@ -475,22 +521,23 @@ async def _call_deepseek_with_search(
 
 
 # ---------------------------------------------------------------------------
-# 鎻掍欢
+# 插件
 # ---------------------------------------------------------------------------
 
 
 @neko_plugin
 class MeetingInsightPlugin(NekoPluginBase):
-    """浼氳璁板綍 / 鍙鍖?/ 鎬荤粨鎻掍欢銆?""
+    """会议记录 / 可视化 / 总结插件。"""
 
-    # ---------------- 鐢熷懡鍛ㄦ湡 ----------------
+    # ---------------- 生命周期 ----------------
 
     @lifecycle(id="startup")
     async def on_startup(self, **_):
         cfg = await self.config.dump(timeout=5.0)
         section = cfg.get("meeting_insight") if isinstance(cfg, dict) else None
         self._cfg = section if isinstance(section, dict) else {}
-        # 鍙褰曘€屾槸鍚﹂厤缃?/ 鏄惁鍚敤銆嶇殑甯冨皵閲忥紝缁濅笉鎵撳嵃 key 鏈韩銆?        self.logger.info(
+        # 只记录「是否配置 / 是否启用」的布尔量，绝不打印 key 本身。
+        self.logger.info(
             "meeting_insight started: config_keys={} deepseek_key_configured={}"
             " web_search_enabled={}",
             len(self._cfg),
@@ -504,12 +551,12 @@ class MeetingInsightPlugin(NekoPluginBase):
         self.logger.info("meeting_insight stopped")
         return Ok({"status": "stopped"})
 
-    # ---------------- 鍙 Plugin Manager / Agent 璺敱瑙﹀彂鐨勫叆鍙?----------------
+    # ---------------- 可被 Plugin Manager / Agent 路由触发的入口 ----------------
 
     @plugin_entry(
         id="meeting_status",
         name="Meeting Insight Status",
-        description="杩斿洖鎻掍欢褰撳墠鐘舵€侊紙鍗犱綅鍏ュ彛锛岀敤浜庨獙璇佹彃浠跺彲琚Е鍙戯級銆?,
+        description="返回插件当前状态（占位入口，用于验证插件可被触发）。",
         llm_result_fields=["summary"],
     )
     async def meeting_status(self, **_):
@@ -529,25 +576,25 @@ class MeetingInsightPlugin(NekoPluginBase):
             },
         })
 
-    # ---------------- 瀵硅瘽鏈?LLM 宸ュ叿 ----------------
+    # ---------------- 对话期 LLM 工具 ----------------
 
     @llm_tool(
         name="meeting_summarize",
         description=(
-            "鏍规嵁浼氳杞啓鏂囨湰鎻愮偧鏍稿績瑕佺偣銆佷細璁憳瑕佷笌寰呭姙浜嬮」锛屽苟鍙寜闇€鑱旂綉妫€绱?
-            "璧勬枡琛ュ厖鑳屾櫙銆傚綋鐢ㄦ埛瑕佹眰鎬荤粨浼氳銆佹暣鐞嗕細璁邯瑕佹垨鎻愬彇寰呭姙鏃惰皟鐢ㄣ€?
-            "transcript 璇峰師鏍蜂紶鍏ヨ浆鍐欐枃鏈細涓嶈缈昏瘧銆佷笉瑕佹敼鍐欍€佷笉瑕佺渷鐣ャ€?
+            "根据会议转写文本提炼核心要点、会议摘要与待办事项，并可按需联网检索"
+            "资料补充背景。当用户要求总结会议、整理会议纪要或提取待办时调用。"
+            "transcript 请原样传入转写文本：不要翻译、不要改写、不要省略。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "transcript": {
                     "type": "string",
-                    "description": "浼氳杞啓鏂囨湰锛堜繚鐣欏師濮嬭瑷€锛屽師鏍蜂紶鍏ワ級",
+                    "description": "会议转写文本（保留原始语言，原样传入）",
                 },
                 "max_points": {
                     "type": "integer",
-                    "description": "鏈€澶氳繑鍥炵殑鏍稿績瑕佺偣鏁帮紙1-20锛岄粯璁?5锛?,
+                    "description": "最多返回的核心要点数（1-20，默认 5）",
                     "default": DEFAULT_MAX_POINTS,
                 },
             },
@@ -562,8 +609,10 @@ class MeetingInsightPlugin(NekoPluginBase):
         max_points: int = DEFAULT_MAX_POINTS,
         **_,
     ):
-        # ---- 1. 鍙傛暟鏍￠獙 ----
-        # 妯″瀷鍙兘杩濆弽 schema锛堟紡浼?/ 浼?null / 浼犻潪瀛楃涓诧級銆傚氨鍦板厹搴曞苟鍥炰竴鏉?        # 缁撴瀯鍖栨彁绀猴紝鑰屼笉鏄 TypeError 鍐掑埌瀹夸富鍙樻垚閫氱敤閿欒淇″皝銆?        if not isinstance(transcript, str) or not transcript.strip():
+        # ---- 1. 参数校验 ----
+        # 模型可能违反 schema（漏传 / 传 null / 传非字符串）。就地兜底并回一条
+        # 结构化提示，而不是让 TypeError 冒到宿主变成通用错误信封。
+        if not isinstance(transcript, str) or not transcript.strip():
             return {
                 "output": {
                     "summary": None,
@@ -580,7 +629,7 @@ class MeetingInsightPlugin(NekoPluginBase):
         truncated = transcript_len > _MAX_TRANSCRIPT_CHARS
         limit = _normalize_limit(max_points)
 
-        # ---- 2. 璇诲彇閰嶇疆锛堝彧鍙栫敤锛岀粷涓嶅啓杩涙棩蹇楋級----
+        # ---- 2. 读取配置（只取用，绝不写进日志）----
         section = self._cfg if isinstance(getattr(self, "_cfg", None), dict) else {}
         api_key = _coerce_text(section.get("deepseek_api_key"))
         base_url = (
@@ -601,7 +650,7 @@ class MeetingInsightPlugin(NekoPluginBase):
             DEFAULT_REQUEST_TIMEOUT,
         )
 
-        # ---- 3. 鏈厤缃?key锛氱洿鎺ユ湰鍦板洖閫€ ----
+        # ---- 3. 未配置 key：直接本地回退 ----
         if not api_key:
             return self._local_fallback(
                 text=text,
@@ -611,10 +660,11 @@ class MeetingInsightPlugin(NekoPluginBase):
                 reason="MISSING_DEEPSEEK_API_KEY",
             )
 
-        # ---- 4. 鏋勯€?Prompt 骞惰皟鐢紙鏄惁鑱旂綉鐢辨ā鍨嬭嚜琛屽喅瀹氾級----
+        # ---- 4. 构造 Prompt 并调用（是否联网由模型自行决定）----
         prompt = _build_prompt(text)
-        # 鍙湪鎬婚绠楀唴鍙戣姹傦細@llm_tool(timeout=60.0) 鏄涓讳晶纭笂闄愶紝
-        # 杩欓噷鐣欏嚭浣欓噺缁?IPC 涓庡簭鍒楀寲锛岄伩鍏嶅崱鍦?60s 琚埅鏂垚 TOOL_TIMEOUT銆?        api_timeout = max(
+        # 只在总预算内发请求：@llm_tool(timeout=60.0) 是宿主侧硬上限，
+        # 这里留出余量给 IPC 与序列化，避免卡在 60s 被截断成 TOOL_TIMEOUT。
+        api_timeout = max(
             _MIN_REQUEST_TIMEOUT,
             min(request_timeout, _TOTAL_BUDGET_SECONDS),
         )
@@ -646,7 +696,7 @@ class MeetingInsightPlugin(NekoPluginBase):
             )
         api_elapsed_ms = int((time.monotonic() - api_started) * 1000)
 
-        # ---- 5. 褰掍竴鍖栨ā鍨嬭緭鍑猴紱妯″瀷娌＄粰 related_context 鏃剁敤鏈嶅姟绔紩鐢ㄥ厹搴?----
+        # ---- 5. 归一化模型输出；模型没给 related_context 时用服务端引用兜底 ----
         result = _normalize_llm_result(parsed, limit)
         if not result["related_context"] and citations:
             result["related_context"] = _citations_to_context(citations)
@@ -654,7 +704,8 @@ class MeetingInsightPlugin(NekoPluginBase):
         if truncated:
             result["summary"] = self._truncation_note(result["summary"])
 
-        # 鍙闀垮害 / 甯冨皵 / 鏉℃暟 / 鑰楁椂锛歱rompt 涓?citations 鍘熸枃鍧囦笉寰楀娉勩€?        self.logger.info(
+        # 只记长度 / 布尔 / 条数 / 耗时：prompt 与 citations 原文均不得外泄。
+        self.logger.info(
             "meeting_summarize: fallback=none transcript_len={} search_used={}"
             " citations_count={} api_ms={}",
             transcript_len,
@@ -667,19 +718,19 @@ class MeetingInsightPlugin(NekoPluginBase):
     @llm_tool(
         name="api_web_search",
         description=(
-            "銆愪紭鍏堜娇鐢ㄦ湰宸ュ叿銆戝綋鐢ㄦ埛鏄庣‘瑕佹眰鑱旂綉鎼滅储銆佹煡璇㈡渶鏂颁俊鎭€佸疄鏃舵暟鎹€佽繎鏈熶簨浠讹紝"
-            "鎴栬€呴渶瑕佹牳瀹炴煇涓簨瀹炴椂锛岃皟鐢ㄦ湰宸ュ叿銆傞€傜敤浜庯細鏌ヨ鏈€鏂版柊闂汇€佷簡瑙ｆ煇浜у搧鎴栨ā鍨嬬殑"
-            "鏈€鏂扮増鏈€佹牳瀹炴煇涓娉曟槸鍚﹀睘瀹炪€佹煡璇㈠綋鍓嶆椂闂寸偣闄勮繎鍙戠敓鐨勪簨浠躲€備笉瑕佺敤浜庯細"
-            "绾€昏緫鎺ㄧ悊銆佷唬鐮佺紪鍐欍€佹枃鏈敼鍐欍€佹棤闇€澶栭儴淇℃伅鐨勫父璇嗛棶绛斻€傛湰宸ュ叿閫氳繃 DeepSeek "
-            "鏈嶅姟绔?API 杩涜鑱旂綉鎼滅储锛屼細娑堣€?API 棰濆害锛岃浠呭湪鐢ㄦ埛鏈夋槑纭仈缃戞悳绱㈤渶姹傛椂璋冪敤锛?
-            "閬垮厤涓嶅繀瑕佺殑璋冪敤銆?
+            "【优先使用本工具】当用户明确要求联网搜索、查询最新信息、实时数据、近期事件，"
+            "或者需要核实某个事实时，调用本工具。适用于：查询最新新闻、了解某产品或模型的"
+            "最新版本、核实某个说法是否属实、查询当前时间点附近发生的事件。不要用于："
+            "纯逻辑推理、代码编写、文本改写、无需外部信息的常识问答。本工具通过 DeepSeek "
+            "服务端 API 进行联网搜索，会消耗 API 额度，请仅在用户有明确联网搜索需求时调用，"
+            "避免不必要的调用。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "瑕佹悳绱㈢殑闂鎴栧叧閿瘝",
+                    "description": "要搜索的问题或关键词",
                 },
             },
             "required": ["query"],
@@ -687,7 +738,7 @@ class MeetingInsightPlugin(NekoPluginBase):
         timeout=60.0,
     )
     async def api_web_search(self, *, query: str = "", **_):
-        # ---- 1. 鍙傛暟鏍￠獙锛氭ā鍨嬪彲鑳芥紡浼?/ 浼?null / 浼犻潪瀛楃涓?----
+        # ---- 1. 参数校验：模型可能漏传 / 传 null / 传非字符串 ----
         if not isinstance(query, str) or not query.strip():
             return {
                 "output": {"summary": None, "sources": []},
@@ -697,7 +748,7 @@ class MeetingInsightPlugin(NekoPluginBase):
 
         query_len = len(query)
 
-        # ---- 2. 璇诲彇閰嶇疆锛堝彧鍙栫敤锛岀粷涓嶅啓杩涙棩蹇楋級----
+        # ---- 2. 读取配置（只取用，绝不写进日志）----
         section = self._cfg if isinstance(getattr(self, "_cfg", None), dict) else {}
         api_key = _coerce_text(section.get("deepseek_api_key"))
         base_url = (
@@ -718,7 +769,7 @@ class MeetingInsightPlugin(NekoPluginBase):
             DEFAULT_REQUEST_TIMEOUT,
         )
 
-        # ---- 3. 鏈厤缃?key锛氱洿鎺ユ嫆缁濄€傜函鎼滅储娌℃湁鏈湴鏇夸唬鍝侊紝涓嶅仛鏈湴鍏滃簳 ----
+        # ---- 3. 未配置 key：直接拒绝。纯搜索没有本地替代品，不做本地兜底 ----
         if not api_key:
             self.logger.warning(
                 "api_web_search rejected: error=MISSING_DEEPSEEK_API_KEY query_len={}",
@@ -730,7 +781,7 @@ class MeetingInsightPlugin(NekoPluginBase):
                 "error": "MISSING_DEEPSEEK_API_KEY",
             }
 
-        # ---- 4. 璋冪敤锛堝鐢ㄤ細璁摼璺悓涓€涓綉缁滃眰锛?---
+        # ---- 4. 调用（复用会议链路同一个网络层）----
         prompt = _build_search_prompt(query)
         api_timeout = max(
             _MIN_REQUEST_TIMEOUT,
@@ -749,7 +800,8 @@ class MeetingInsightPlugin(NekoPluginBase):
                 web_search_max_uses=web_search_max_uses,
             )
         except Exception as exc:
-            # 鍙寮傚父绫诲瀷涓庣姸鎬佺爜锛歲uery 鍘熸枃涓庡搷搴斾綋閮戒笉寰楀娉勩€?            self.logger.warning(
+            # 只记异常类型与状态码：query 原文与响应体都不得外泄。
+            self.logger.warning(
                 "api_web_search failed: err_type={} status={} query_len={}",
                 type(exc).__name__,
                 _http_status_of(exc),
@@ -763,7 +815,7 @@ class MeetingInsightPlugin(NekoPluginBase):
             }
         api_elapsed_ms = int((time.monotonic() - api_started) * 1000)
 
-        # ---- 5. 褰掍竴鍖栨ā鍨嬭緭鍑猴紱妯″瀷娌＄粰 sources 鏃剁敤鏈嶅姟绔紩鐢ㄥ厹搴?----
+        # ---- 5. 归一化模型输出；模型没给 sources 时用服务端引用兜底 ----
         summary = _coerce_text(parsed.get("summary"))
         sources = _as_text_list(parsed.get("sources"), max_items=_MAX_RELATED_CONTEXT)
         if not sources and citations:
@@ -777,20 +829,20 @@ class MeetingInsightPlugin(NekoPluginBase):
         )
         return {
             "output": {
-                "summary": summary or "锛堟湭鑳戒粠鎼滅储缁撴灉涓彁鐐煎嚭鍥炵瓟銆傦級",
+                "summary": summary or "（未能从搜索结果中提炼出回答。）",
                 "sources": sources,
             },
             "is_error": False,
         }
 
-    # ---------------- 鍐呴儴杈呭姪 ----------------
+    # ---------------- 内部辅助 ----------------
 
     @staticmethod
     def _truncation_note(summary: object) -> str:
-        """缁欐憳瑕佽拷鍔犳埅鏂鏄庯紙鍘熸枃杩囬暱鏃剁敤锛夈€?""
+        """给摘要追加截断说明（原文过长时用）。"""
         return (
             f"{_coerce_text(summary)}"
-            f"锛堣浆鍐欒繃闀匡紝宸叉埅鏂嚦鍓?{_MAX_TRANSCRIPT_CHARS} 瀛楃锛?
+            f"（转写过长，已截断至前 {_MAX_TRANSCRIPT_CHARS} 字符）"
         )
 
     def _local_fallback(
@@ -802,8 +854,10 @@ class MeetingInsightPlugin(NekoPluginBase):
         transcript_len: int,
         reason: str,
     ) -> dict[str, object]:
-        """鏈湴缁撴瀯鍖栨彁鍙栧厹搴曪紝骞跺湪杈撳嚭閲屾爣璁?``fallback: true``銆?
-        涓夋潯璺緞鍏辩敤锛氭湭閰嶇疆 key銆丄PI 璋冪敤澶辫触銆丄PI 鐩存帴鎶涘嚭銆?        """
+        """本地结构化提取兜底，并在输出里标记 ``fallback: true``。
+
+        三条路径共用：未配置 key、API 调用失败、API 直接抛出。
+        """
         result = _summarize_local(text, limit)
         result["fallback"] = True
         result["fallback_reason"] = reason
